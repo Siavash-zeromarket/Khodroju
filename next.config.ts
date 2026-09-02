@@ -9,6 +9,12 @@ const nextConfig: NextConfig = {
         port: "8000",
         pathname: "/storage/v1/object/public/**",
       },
+      {
+        protocol: "http",
+        hostname: "92.114.51.99",
+        port: "8000",
+        pathname: "/storage/v1/object/public/**",
+      },
     ],
   },
 };
