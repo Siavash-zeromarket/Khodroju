@@ -1,8 +1,16 @@
 // lib/telegram.ts
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import {
+  contentTypeFor,
+  downloadStoredFile,
+  ensureStoredFile,
+  removeAllStoredFiles,
+  removeStoredFile,
+} from "@/lib/telegram/fileStorage";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://khodroju.ir";
 const ADMIN_IDS = (
   process.env.TELEGRAM_ADMIN_IDS ||
   process.env.TELEGRAM_ADMIN_ID ||
@@ -628,23 +636,51 @@ export async function sendDocument(
   }
 }
 
-export async function getTelegramFileUrl(fileId: string): Promise<string | null> {
+/**
+ * Send the actual file to the chat as an attachment, with `caption` as the
+ * message text. Tries backend storage first (real filename guaranteed via
+ * multipart upload), then Telegram's own copy by file_id.
+ * Returns false so the caller can fall back to a link-only message.
+ */
+export async function sendFileDocument(
+  chatId: string | number,
+  file: FileItem,
+  caption: string,
+): Promise<boolean> {
   try {
-    console.log("getTelegramFileUrl called with:", fileId);
-    const response = await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`,
-    );
-    const data = await response.json();
-    console.log("getFile API response:", data);
-    if (data.ok && data.result?.file_path) {
-      const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
-      console.log("File URL constructed:", url);
-      return url;
+    const path = await ensureStoredFile(file);
+    const blob = path ? await downloadStoredFile(path) : null;
+    if (blob) {
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      form.append(
+        "document",
+        new Blob([await blob.arrayBuffer()], {
+          type: blob.type || contentTypeFor(file.filename),
+        }),
+        file.filename,
+      );
+      form.append("caption", caption);
+      form.append("parse_mode", "HTML");
+
+      const response = await fetch(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,
+        { method: "POST", body: form },
+      );
+      const result = await response.json();
+      if (result.ok) return true;
+      console.error("sendFileDocument upload failed:", result.description);
+    }
+
+    // Fallback: resend Telegram's own stored copy by file_id (keeps filename)
+    if (file.telegram_file_id) {
+      const result = await sendDocument(chatId, file.telegram_file_id, caption);
+      if (result?.ok) return true;
     }
   } catch (error) {
-    console.error("Error getting file URL:", error);
+    console.error("sendFileDocument error:", error);
   }
-  return null;
+  return false;
 }
 
 // ==========================================
@@ -1009,6 +1045,11 @@ export async function handleDeleteCategory(chatId: number, categoryKey: string) 
     return;
   }
 
+  // Drop their stored copies too (subcategories were already handled above)
+  for (const f of category.files) {
+    await removeStoredFile(f);
+  }
+
   // Delete the category
   const { error: catError } = await getSupabase().from("categories").delete().eq("key", categoryKey);
   if (catError) {
@@ -1056,6 +1097,8 @@ export async function handlePurgeAll(chatId: number) {
   // .neq with an impossible value is the documented way to match all rows
   await getSupabase().from("files").delete().neq("id", "");
   await getSupabase().from("categories").delete().neq("key", "");
+
+  await removeAllStoredFiles();
 
   invalidateCategoriesCache();
   await clearAdminState(chatId);
@@ -1163,6 +1206,8 @@ export async function handleDeleteFile(chatId: number, fileId: string) {
     await sendMessage(chatId, "❌ خطا در حذف فایل.");
     return;
   }
+
+  await removeStoredFile(file);
 
   invalidateCategoriesCache();
   await sendMessage(chatId, `✅ فایل "${esc(file.title)}" حذف شد.`);
@@ -1495,19 +1540,22 @@ export async function handleAdminFileUpload(
     description: description || "",
   });
 
-  const fileUrl = await getTelegramFileUrl(document.file_id);
+  // Persist bytes into backend storage right away (lazy migration covers legacy rows)
+  const stored = await ensureStoredFile({
+    id: generatedFileId,
+    filename: document.file_name,
+    telegram_file_id: document.file_id,
+  });
+
   const displayTitle = fileName || document.file_name.replace(/\.[^/.]+$/, "");
-  if (fileUrl) {
-    await sendMessage(
-      chatId,
-      `✅ فایل "${esc(displayTitle)}" با موفقیت به دسته "${esc(category.title)}" اضافه شد!\n\n📎 شناسه فایل: ${generatedFileId}\n📥 لینک مستقیم: ${fileUrl}`,
-    );
-  } else {
-    await sendMessage(
-      chatId,
-      `✅ فایل "${esc(displayTitle)}" به دسته "${esc(category.title)}" اضافه شد (لینک مستقیم در دسترس نیست).`,
-    );
-  }
+  const fileUrl = `${SITE_URL}/api/files/${generatedFileId}`;
+  await sendMessage(
+    chatId,
+    `✅ فایل "${esc(displayTitle)}" با موفقیت به دسته "${esc(category.title)}" اضافه شد!\n\n📎 شناسه فایل: ${generatedFileId}\n📥 لینک دانلود: ${fileUrl}` +
+      (stored
+        ? ""
+        : "\n\n⚠️ ذخیره‌سازی در سرور ناموفق بود؛ در درخواست بعدی به‌صورت خودکار دوباره تلاش می‌شود."),
+  );
 
   await clearAdminState(chatId);
   await sendAdminManagementMenu(chatId);

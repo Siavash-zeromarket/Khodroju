@@ -2,7 +2,6 @@
 
 import {
   sendCategoryMenu,
-  sendDocument,
   sendMessage,
   sendSupportInfo,
   sendWelcomeMessage,
@@ -23,6 +22,7 @@ import {
   handlePurgeAll,
   sendAdminWelcomeMessage,
   sendAdminManagementMenu,
+  sendFileDocument,
   getFile,
   seedInitialData,
   sendAddFileDescriptionPrompt,
@@ -32,7 +32,6 @@ import {
   hasPhoneNumber,
   sendPhoneRequest,
   updateUserPhone,
-  getTelegramFileUrl,
   esc,
   isChannelMember,
   sendChannelJoinRequest,
@@ -175,20 +174,17 @@ export async function POST(req: Request) {
         console.log("File found:", targetFile);
         if (targetFile) {
           await incrementDownload(fileId, chatId);
-          
-          // Generate download link
-          let downloadUrl: string;
-          if (targetFile.telegram_file_id) {
-            const telegramUrl = await getTelegramFileUrl(targetFile.telegram_file_id);
-            downloadUrl = telegramUrl || `${BASE_URL}/files/${targetFile.filename}`;
-          } else {
-            downloadUrl = `${BASE_URL}/files/${targetFile.filename}`;
+
+          const downloadUrl = `${BASE_URL}/api/files/${targetFile.id}`;
+          const caption = `📄 ${esc(targetFile.title)}\n\n🔗 لینک دانلود:\n${downloadUrl}`;
+
+          // Attach the actual document from backend storage + link in caption.
+          // If attaching fails, fall back to a link-only message.
+          const sent = await sendFileDocument(chatId, targetFile, caption);
+          if (!sent) {
+            await sendMessage(chatId, `${caption}\n\nبرای دانلود روی لینک بالا کلیک کنید.`);
           }
-          
-          await sendMessage(
-            chatId,
-            `📄 ${esc(targetFile.title)}\n\n🔗 لینک دانلود:\n${downloadUrl}\n\nبرای دانلود روی لینک بالا کلیک کنید.`
-          );        } else {
+        } else {
           await sendMessage(chatId, "❌ فایل مورد نظر یافت نشد.");
         }
         return NextResponse.json({ success: true });
