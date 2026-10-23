@@ -2,6 +2,7 @@
 
 import { ChevronDown, Loader2, Search, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 interface SearchSelectProps {
   id?: string;
@@ -32,9 +33,11 @@ export function SearchSelect({
 }: SearchSelectProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   const filtered = useMemo(() => {
     if (!query.trim()) return options;
@@ -61,12 +64,31 @@ export function SearchSelect({
     [query],
   );
 
+  const updateDropdownPosition = useCallback(() => {
+    if (triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect();
+      setDropdownStyle({
+        top: rect.bottom + window.scrollY + 4, // mt-1 = 4px
+        left: rect.left + window.scrollX,
+        width: rect.width,
+        minWidth: rect.width,
+      });
+    }
+  }, []);
+
   useEffect(() => {
     if (open) {
       setQuery("");
+      updateDropdownPosition();
       requestAnimationFrame(() => inputRef.current?.focus());
+      window.addEventListener("scroll", updateDropdownPosition);
+      window.addEventListener("resize", updateDropdownPosition);
     }
-  }, [open]);
+    return () => {
+      window.removeEventListener("scroll", updateDropdownPosition);
+      window.removeEventListener("resize", updateDropdownPosition);
+    };
+  }, [open, updateDropdownPosition]);
 
   useEffect(() => {
     if (!open) return;
@@ -75,6 +97,9 @@ export function SearchSelect({
         containerRef.current &&
         !containerRef.current.contains(e.target as Node)
       ) {
+        // Also check if click is inside the portal dropdown
+        const dropdown = document.querySelector("[data-search-select-dropdown]");
+        if (dropdown && dropdown.contains(e.target as Node)) return;
         setOpen(false);
       }
     };
@@ -91,8 +116,61 @@ export function SearchSelect({
     setOpen(false);
   };
 
+  const dropdownContent = (
+    <div
+      data-search-select-dropdown
+      ref={listRef}
+      className="bg-popover border border-border rounded-lg shadow-lg z-50 overflow-hidden"
+      style={dropdownStyle}
+    >
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
+        <Search size={14} className="shrink-0 text-muted-foreground" />
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="جستجو…"
+          className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+          dir="rtl"
+        />
+        {query && (
+          <button
+            type="button"
+            onClick={() => setQuery("")}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <X size={14} />
+          </button>
+        )}
+      </div>
+      <div className="max-h-56 overflow-y-auto overscroll-contain py-1">
+        {filtered.length === 0 ? (
+          <p className="px-4 py-6 text-center text-xs text-muted-foreground">
+            {emptyText}
+          </p>
+        ) : (
+          filtered.map((opt) => (
+            <button
+              key={opt}
+              type="button"
+              onClick={() => select(opt)}
+              className={`w-full text-right px-4 py-2 text-sm transition-colors duration-100 ${
+                opt === value
+                  ? "bg-primary/10 text-primary font-600"
+                  : "text-foreground hover:bg-muted"
+              }`}
+            >
+              {highlightMatch(opt)}
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  );
+
   return (
-    <div ref={containerRef} className={`relative ${className ?? ""}`}>
+    <div ref={containerRef} className={className ?? ""}>
       {label && (
         <label
           htmlFor={id}
@@ -102,6 +180,7 @@ export function SearchSelect({
         </label>
       )}
       <button
+        ref={triggerRef}
         id={id}
         type="button"
         disabled={disabled || loading}
@@ -126,56 +205,7 @@ export function SearchSelect({
         )}
       </button>
 
-      {open && (
-        <div className="absolute top-full left-0 right-0 mt-1 bg-popover border border-border rounded-lg shadow-lg z-50 overflow-hidden">
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
-            <Search size={14} className="shrink-0 text-muted-foreground" />
-            <input
-              ref={inputRef}
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="جستجو…"
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-              dir="rtl"
-            />
-            {query && (
-              <button
-                type="button"
-                onClick={() => setQuery("")}
-                className="shrink-0 text-muted-foreground hover:text-foreground"
-              >
-                <X size={14} />
-              </button>
-            )}
-          </div>
-          <div
-            ref={listRef}
-            className="max-h-56 overflow-y-auto overscroll-contain py-1"
-          >
-            {filtered.length === 0 ? (
-              <p className="px-4 py-6 text-center text-xs text-muted-foreground">
-                {emptyText}
-              </p>
-            ) : (
-              filtered.map((opt) => (
-                <button
-                  key={opt}
-                  type="button"
-                  onClick={() => select(opt)}
-                  className={`w-full text-right px-4 py-2 text-sm transition-colors duration-100 ${
-                    opt === value
-                      ? "bg-primary/10 text-primary font-600"
-                      : "text-foreground hover:bg-muted"
-                  }`}
-                >
-                  {highlightMatch(opt)}
-                </button>
-              ))
-            )}
-          </div>
-        </div>
-      )}
+      {open && createPortal(dropdownContent, document.body)}
     </div>
   );
 }
