@@ -182,7 +182,7 @@ export default function UserManageView({ userId }: Props) {
             responseRate={responseRate}
             salesVolume={salesVolume}
           />
-          <UserListingsCard listings={listings} loading={listingsLoading} />
+          <UserListingsCard listings={listings} loading={listingsLoading} phone={user.phone ?? undefined} />
         </div>
 
         {/* Management (1/3) */}

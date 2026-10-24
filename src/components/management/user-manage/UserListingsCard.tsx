@@ -1,20 +1,27 @@
 import { formatPrice } from "@/context/data";
 import StatusBadge from "../../shared/StatusBadge";
 import type { Listing } from "@/types/dataTypes";
-import { ExternalLink, Loader2, Pencil, ShoppingBag } from "lucide-react";
+import { ExternalLink, Loader2, Pencil, Phone, ShoppingBag } from "lucide-react";
 import Link from "next/link";
 
 interface Props {
   listings: Listing[];
   loading: boolean;
+  phone?: string;
 }
 
-export function UserListingsCard({ listings, loading }: Props) {
+export function UserListingsCard({ listings, loading, phone }: Props) {
   return (
     <div className="card-elevated p-6">
       <div className="flex items-center gap-2 mb-4">
         <ShoppingBag size={18} className="text-primary" />
         <h2 className="text-sm font-700 text-foreground">آگهی‌ها</h2>
+        {phone && (
+          <div className="flex items-center gap-1 ml-auto text-sm text-muted-foreground">
+            <Phone size={14} className="text-primary shrink-0" />
+            <span dir="ltr">{phone}</span>
+          </div>
+        )}
       </div>
       {loading ? (
         <div className="flex items-center justify-center gap-2 py-8">

@@ -2,7 +2,6 @@
 
 import {
   sendCategoryMenu,
-  sendDocument,
   sendMessage,
   sendSupportInfo,
   sendWelcomeMessage,
@@ -19,7 +18,11 @@ import {
   handleAddCategory,
   handleAddSubcategory,
   handleEditCategory,
+  handleEditFileDescription,
+  handlePurgeAll,
   sendAdminWelcomeMessage,
+  sendAdminManagementMenu,
+  sendFileDocument,
   getFile,
   seedInitialData,
   sendAddFileDescriptionPrompt,
@@ -29,7 +32,9 @@ import {
   hasPhoneNumber,
   sendPhoneRequest,
   updateUserPhone,
-  getTelegramFileUrl,
+  esc,
+  isChannelMember,
+  sendChannelJoinRequest,
 } from "@/lib/telegram/telegram";
 import { NextResponse } from "next/server";
 
@@ -81,6 +86,31 @@ export async function POST(req: Request) {
       // Check if admin
       const adminCheck = isAdmin(chatId);
 
+      // Re-check channel membership after user joins
+      if (buttonData === "check_membership") {
+        console.log("Membership re-check:", chatId);
+        const inChannel = await isChannelMember(chatId);
+        if (!inChannel) {
+          await sendMessage(chatId, "❌ شما هنوز در کانال عضو نشده‌اید. لطفاً ابتدا عضو شوید.");
+          await sendChannelJoinRequest(chatId);
+        } else {
+          await sendMessage(chatId, "✅ عضویت شما تایید شد!");
+          // Resume normal flow
+          if (adminCheck) {
+            await sendAdminWelcomeMessage(chatId);
+          } else {
+            const hasPhone = await hasPhoneNumber(chatId);
+            if (!hasPhone) {
+              await setAdminState(chatId, "waiting_for_phone");
+              await sendPhoneRequest(chatId);
+            } else {
+              await sendWelcomeMessage(chatId);
+            }
+          }
+        }
+        return NextResponse.json({ success: true });
+      }
+
       // Handle buttons that work for BOTH admins and users FIRST
       if (buttonData === "contact_support") {
         await sendSupportInfo(chatId);
@@ -91,7 +121,12 @@ export async function POST(req: Request) {
           await clearAdminState(chatId);
           await sendAdminWelcomeMessage(chatId);
         } else {
-          await sendWelcomeMessage(chatId);
+          const inChannel = await isChannelMember(chatId);
+          if (!inChannel) {
+            await sendChannelJoinRequest(chatId);
+          } else {
+            await sendWelcomeMessage(chatId);
+          }
         }
         return NextResponse.json({ success: true });
       }
@@ -100,6 +135,12 @@ export async function POST(req: Request) {
       if (buttonData.startsWith("cat_")) {
         console.log("Category click:", { chatId, buttonData, adminCheck });
         if (!adminCheck) {
+          const inChannel = await isChannelMember(chatId);
+          console.log("Channel check for category:", { chatId, inChannel });
+          if (!inChannel) {
+            await sendChannelJoinRequest(chatId);
+            return NextResponse.json({ success: true });
+          }
           const hasPhone = await hasPhoneNumber(chatId);
           console.log("Phone check for category:", { chatId, hasPhone });
           if (!hasPhone) {
@@ -114,6 +155,12 @@ export async function POST(req: Request) {
       if (buttonData.startsWith("file_")) {
         console.log("File click:", { chatId, buttonData, adminCheck });
         if (!adminCheck) {
+          const inChannel = await isChannelMember(chatId);
+          console.log("Channel check for file:", { chatId, inChannel });
+          if (!inChannel) {
+            await sendChannelJoinRequest(chatId);
+            return NextResponse.json({ success: true });
+          }
           const hasPhone = await hasPhoneNumber(chatId);
           console.log("Phone check for file:", { chatId, hasPhone });
           if (!hasPhone) {
@@ -126,21 +173,17 @@ export async function POST(req: Request) {
         const targetFile = await getFile(fileId);
         console.log("File found:", targetFile);
         if (targetFile) {
-          await incrementDownload(fileId);
-          
-          // Generate download link
-          let downloadUrl: string;
-          if (targetFile.telegram_file_id) {
-            const telegramUrl = await getTelegramFileUrl(targetFile.telegram_file_id);
-            downloadUrl = telegramUrl || `${BASE_URL}/files/${targetFile.filename}`;
-          } else {
-            downloadUrl = `${BASE_URL}/files/${targetFile.filename}`;
+          await incrementDownload(fileId, chatId);
+
+          const downloadUrl = `${BASE_URL}/api/files/${targetFile.id}`;
+          const caption = `📄 ${esc(targetFile.title)}\n\n🔗 لینک دانلود:\n${downloadUrl}`;
+
+          // Attach the actual document from backend storage + link in caption.
+          // If attaching fails, fall back to a link-only message.
+          const sent = await sendFileDocument(chatId, targetFile, caption);
+          if (!sent) {
+            await sendMessage(chatId, `${caption}\n\nبرای دانلود روی لینک بالا کلیک کنید.`);
           }
-          
-          await sendMessage(
-            chatId,
-            `📄 ${targetFile.title}\n\n🔗 لینک دانلود:\n${downloadUrl}\n\nبرای دانلود روی لینک بالا کلیک کنید.`
-          );
         } else {
           await sendMessage(chatId, "❌ فایل مورد نظر یافت نشد.");
         }
@@ -171,6 +214,19 @@ export async function POST(req: Request) {
       const adminCheck = isAdmin(chatId);
       const step = await getAdminState(chatId);
       const sessionData = await getAdminSessionData(chatId);
+
+      // Handle purge-all confirmation (requires typing delete_all exactly)
+      if (adminCheck && update.message.text && step === "purge_all_confirm") {
+        const text = update.message.text.trim();
+        if (text === "delete_all") {
+          await handlePurgeAll(chatId);
+        } else {
+          await clearAdminState(chatId);
+          await sendMessage(chatId, "❌ پاکسازی لغو شد.");
+          await sendAdminManagementMenu(chatId);
+        }
+        return NextResponse.json({ success: true });
+      }
 
       // Handle admin document upload
       if (adminCheck && update.message.document) {
@@ -211,6 +267,12 @@ export async function POST(req: Request) {
         return NextResponse.json({ success: true });
       }
 
+      // Handle admin text input for edit file description
+      if (adminCheck && update.message.text && step === "edit_file_description" && sessionData.selectedFileId) {
+        await handleEditFileDescription(chatId, sessionData.selectedFileId, update.message.text.trim());
+        return NextResponse.json({ success: true });
+      }
+
       // Handle phone number input (text)
       if (!adminCheck && update.message.text && step === "waiting_for_phone") {
         const phoneNumber = update.message.text.trim();
@@ -248,27 +310,38 @@ export async function POST(req: Request) {
             await clearAdminState(chatId);
             await sendAdminWelcomeMessage(chatId);
           } else {
-            const hasPhone = await hasPhoneNumber(chatId);
-            console.log("Phone check for /start:", { chatId, hasPhone });
-            if (!hasPhone) {
-              console.log("Calling sendPhoneRequest for:", chatId);
-              await setAdminState(chatId, "waiting_for_phone");
-              await sendPhoneRequest(chatId);
-              console.log("sendPhoneRequest completed for:", chatId);
+            const inChannel = await isChannelMember(chatId);
+            console.log("Channel check for /start:", { chatId, inChannel });
+            if (!inChannel) {
+              await sendChannelJoinRequest(chatId);
             } else {
-              await sendWelcomeMessage(chatId);
+              const hasPhone = await hasPhoneNumber(chatId);
+              console.log("Phone check for /start:", { chatId, hasPhone });
+              if (!hasPhone) {
+                console.log("Calling sendPhoneRequest for:", chatId);
+                await setAdminState(chatId, "waiting_for_phone");
+                await sendPhoneRequest(chatId);
+                console.log("sendPhoneRequest completed for:", chatId);
+              } else {
+                await sendWelcomeMessage(chatId);
+              }
             }
           }
         } else if (text === "/categories") {
           if (adminCheck) {
             await sendAdminWelcomeMessage(chatId);
           } else {
-            const hasPhone = await hasPhoneNumber(chatId);
-            if (!hasPhone) {
-              await setAdminState(chatId, "waiting_for_phone");
-              await sendPhoneRequest(chatId);
+            const inChannel = await isChannelMember(chatId);
+            if (!inChannel) {
+              await sendChannelJoinRequest(chatId);
             } else {
-              await sendWelcomeMessage(chatId);
+              const hasPhone = await hasPhoneNumber(chatId);
+              if (!hasPhone) {
+                await setAdminState(chatId, "waiting_for_phone");
+                await sendPhoneRequest(chatId);
+              } else {
+                await sendWelcomeMessage(chatId);
+              }
             }
           }
         } else if (text === "/support") {

@@ -1,8 +1,16 @@
 // lib/telegram.ts
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import {
+  contentTypeFor,
+  downloadStoredFile,
+  ensureStoredFile,
+  removeAllStoredFiles,
+  removeStoredFile,
+} from "@/lib/telegram/fileStorage";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://khodroju.ir";
 const ADMIN_IDS = (
   process.env.TELEGRAM_ADMIN_IDS ||
   process.env.TELEGRAM_ADMIN_ID ||
@@ -23,6 +31,25 @@ function getSupabase(): SupabaseClient {
   }
   return _supabase;
 }
+
+// Compact key generator — keeps callback_data well under Telegram's 64-byte limit
+function generateKey(prefix: string): string {
+  const ts = Date.now().toString(36);
+  const rnd = Math.random().toString(36).slice(2, 6);
+  return `${prefix}${ts}${rnd}`;
+}
+
+// Escape HTML entities (all messages use parse_mode: "HTML").
+// Null/undefined-safe — DB columns may legitimately be null.
+export function esc(s: string | null | undefined): string {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+const SEP = "━━━━━━━━━━━━━━━━━━━";
 
 // ==========================================
 // 🤖 Bot Commands (for Telegram suggestions menu)
@@ -88,7 +115,9 @@ interface AdminSession {
     | 'stats' 
     | 'users'
     | 'waiting_for_phone'
-    | 'edit_category_name';
+    | 'edit_category_name'
+    | 'edit_file_description'
+    | 'purge_all_confirm';
   data: Record<string, any>;
   updated_at: string;
 }
@@ -271,8 +300,32 @@ export async function fileExists(fileId: string): Promise<boolean> {
   return !!data;
 }
 
-export async function incrementDownload(fileId: string): Promise<void> {
-  await getSupabase().rpc("increment_download", { file_id: fileId });
+export async function incrementDownload(fileId: string, userId?: number): Promise<void> {
+  // Try RPC first, fall back to read-then-write (avoids dependency on custom function)
+  try {
+    const { error } = await getSupabase().rpc("increment_download", { file_id: fileId });
+    if (error) throw error;
+  } catch (err) {
+    console.log("RPC increment failed, using fallback:", err);
+    const { data: current } = await getSupabase()
+      .from("files")
+      .select("downloads")
+      .eq("id", fileId)
+      .single();
+    await getSupabase()
+      .from("files")
+      .update({ downloads: (current?.downloads || 0) + 1 })
+      .eq("id", fileId);
+  }
+
+  // Log download for detailed analytics (warns if table missing)
+  if (userId) {
+    const { error: logError } = await getSupabase()
+      .from("downloads")
+      .insert({ file_id: fileId, user_id: userId });
+    if (logError) console.log("downloads log skipped:", logError.message);
+  }
+
   invalidateCategoriesCache();
 }
 
@@ -359,6 +412,57 @@ export async function sendPhoneRequest(chatId: string | number) {
   await sendMessage(chatId, text);
 }
 
+// ==========================================
+// 📢 Channel Membership Gate
+// ==========================================
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || "";
+const CHANNEL_INVITE = process.env.TELEGRAM_CHANNEL_INVITE || "";
+
+function getChannelInviteLink(): string {
+  if (CHANNEL_INVITE) return CHANNEL_INVITE;
+  if (CHANNEL_ID.startsWith("@")) return `https://t.me/${CHANNEL_ID.slice(1)}`;
+  return "https://telegram.org/";
+}
+
+// Fails OPEN (returns true) when channel isn't configured or bot can't verify,
+// so a misconfiguration never locks users out of the bot.
+export async function isChannelMember(chatId: number): Promise<boolean> {
+  if (!CHANNEL_ID) return true;
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(CHANNEL_ID)}&user_id=${chatId}`,
+    );
+    const data = await response.json();
+
+    if (!data.ok) {
+      console.error("getChatMember failed:", data.description);
+      return true;
+    }
+
+    const status = data.result?.status;
+    // "left" and "kicked" are not members
+    return status === "creator" || status === "administrator" || status === "member" || status === "restricted";
+  } catch (error) {
+    console.error("isChannelMember error:", error);
+    return true;
+  }
+}
+
+export async function sendChannelJoinRequest(chatId: string | number) {
+  const text =
+    `📢 برای استفاده از ربات، لطفاً ابتدا در کانال ما عضو شوید:\n\n` +
+    `۱. روی دکمه «📢 عضویت در کانال» کلیک کنید\n` +
+    `۲. پس از عضویت، دکمه «✅ عضو شدم» را بزنید`;
+
+  const inline_keyboard = [
+    [{ text: "📢 عضویت در کانال", url: getChannelInviteLink() }],
+    [{ text: "✅ عضو شدم، بررسی کن", callback_data: "check_membership" }],
+  ];
+
+  await sendMessage(chatId, text, { inline_keyboard });
+}
+
 // Admin Sessions
 export async function getAdminState(
   chatId: number,
@@ -418,8 +522,62 @@ export function isAdmin(chatId: number): boolean {
 // ==========================================
 
 export async function seedInitialData(): Promise<void> {
-  // No hardcoded categories - admin creates them
-  return;
+  // Migrate over-long category keys (legacy keys could exceed Telegram's 64-byte callback limit)
+  try {
+    const { data: cats } = await getSupabase().from("categories").select("key");
+    for (const c of cats || []) {
+      if (c.key.length <= 30) continue;
+
+      const newKey = generateKey("cat");
+      const { data: full } = await getSupabase()
+        .from("categories")
+        .select("*")
+        .eq("key", c.key)
+        .single();
+      if (!full) continue;
+
+      // Insert new row first so FKs (files.category_key) can be repointed
+      await getSupabase()
+        .from("categories")
+        .insert({ key: newKey, title: full.title, parent_key: full.parent_key });
+      await getSupabase().from("files").update({ category_key: newKey }).eq("category_key", c.key);
+      await getSupabase().from("categories").update({ parent_key: newKey }).eq("parent_key", c.key);
+      await getSupabase().from("categories").delete().eq("key", c.key);
+
+      console.log(`Migrated long category key: ${c.key} -> ${newKey}`);
+    }
+    invalidateCategoriesCache();
+  } catch (err) {
+    console.error("Key migration failed:", err);
+  }
+
+  // Migrate over-long file IDs (legacy IDs came from raw filenames with no length cap)
+  try {
+    const { data: files } = await getSupabase().from("files").select("*");
+    for (const f of files || []) {
+      if (f.id.length <= 30) continue;
+
+      const newId = generateKey("f");
+      // Copy the row under a compact ID
+      await getSupabase().from("files").insert({
+        id: newId,
+        title: f.title,
+        filename: f.filename,
+        category_key: f.category_key,
+        telegram_file_id: f.telegram_file_id,
+        downloads: f.downloads || 0,
+        description: f.description || "",
+      });
+      // Repoint download logs so analytics survive the rename
+      await getSupabase().from("downloads").update({ file_id: newId }).eq("file_id", f.id);
+      await getSupabase().from("files").delete().eq("id", f.id);
+
+      console.log(`Migrated long file id: ${f.id} -> ${newId}`);
+    }
+    invalidateCategoriesCache();
+  } catch (err) {
+    console.error("File id migration failed:", err);
+  }
 }
 
 // ==========================================
@@ -478,23 +636,51 @@ export async function sendDocument(
   }
 }
 
-export async function getTelegramFileUrl(fileId: string): Promise<string | null> {
+/**
+ * Send the actual file to the chat as an attachment, with `caption` as the
+ * message text. Tries backend storage first (real filename guaranteed via
+ * multipart upload), then Telegram's own copy by file_id.
+ * Returns false so the caller can fall back to a link-only message.
+ */
+export async function sendFileDocument(
+  chatId: string | number,
+  file: FileItem,
+  caption: string,
+): Promise<boolean> {
   try {
-    console.log("getTelegramFileUrl called with:", fileId);
-    const response = await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`,
-    );
-    const data = await response.json();
-    console.log("getFile API response:", data);
-    if (data.ok && data.result?.file_path) {
-      const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
-      console.log("File URL constructed:", url);
-      return url;
+    const path = await ensureStoredFile(file);
+    const blob = path ? await downloadStoredFile(path) : null;
+    if (blob) {
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      form.append(
+        "document",
+        new Blob([await blob.arrayBuffer()], {
+          type: blob.type || contentTypeFor(file.filename),
+        }),
+        file.filename,
+      );
+      form.append("caption", caption);
+      form.append("parse_mode", "HTML");
+
+      const response = await fetch(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,
+        { method: "POST", body: form },
+      );
+      const result = await response.json();
+      if (result.ok) return true;
+      console.error("sendFileDocument upload failed:", result.description);
+    }
+
+    // Fallback: resend Telegram's own stored copy by file_id (keeps filename)
+    if (file.telegram_file_id) {
+      const result = await sendDocument(chatId, file.telegram_file_id, caption);
+      if (result?.ok) return true;
     }
   } catch (error) {
-    console.error("Error getting file URL:", error);
+    console.error("sendFileDocument error:", error);
   }
-  return null;
+  return false;
 }
 
 // ==========================================
@@ -525,7 +711,7 @@ export async function sendCategoryMenu(chatId: string | number, categoryKey: str
   const subcategories = category.subcategories || [];
   const files = category.files || [];
 
-  let text = `📂 بخش: ${category.title}\n\n`;
+  let text = `📂 بخش: ${esc(category.title)}\n\n`;
   const inline_keyboard = [];
 
   if (subcategories.length > 0) {
@@ -598,9 +784,11 @@ export async function sendAdminManagementMenu(chatId: string | number) {
   const inline_keyboard = [
     [{ text: "➕ افزودن فایل", callback_data: "a_add_file" }],
     [{ text: "🗂️ مدیریت فایل‌ها (حذف)", callback_data: "a_manage_files" }],
+    [{ text: "✏️ ویرایش توضیحات فایل", callback_data: "a_edit_file_desc" }],
     [{ text: "📁 افزودن دسته‌بندی", callback_data: "a_add_cat" }],
     [{ text: "📂 افزودن زیرمجموعه", callback_data: "a_add_sub" }],
     [{ text: "🗑️ حذف دسته/زیرمجموعه", callback_data: "a_del_cat" }],
+    [{ text: "💥 پاکسازی کامل", callback_data: "a_purge_all" }],
     [{ text: "✏️ ویرایش دسته/زیرمجموعه", callback_data: "a_edit_cat" }],
     [{ text: "📊 آمار دانلودها", callback_data: "a_stats" }],
     [{ text: "👥 لیست کاربران", callback_data: "a_users" }],
@@ -620,7 +808,7 @@ export async function sendDeleteCategorySelection(chatId: string | number, paren
     const parent = await getCategory(parentKey);
     if (!parent) return;
     categories = parent.subcategories || [];
-    text = `🗑️ حذف زیرمجموعه در: ${parent.title}\n\nانتخاب کنید:`;
+    text = `🗑️ حذف زیرمجموعه در: ${esc(parent.title)}\n\nانتخاب کنید:`;
     backCallback = `dc_${parentKey}`;
   } else {
     // Show root categories
@@ -671,12 +859,12 @@ export async function sendConfirmDeleteCategory(chatId: string | number, categor
   const subCount = subcategories.length;
   const fileCount = files.length;
 
-  let warningText = `⚠️ آیا از حذف "${category.title}" مطمئن هستید؟\n\n`;
+  let warningText = `⚠️ آیا از حذف "${esc(category.title)}" مطمئن هستید؟\n\n`;
 
   if (fileCount > 0) {
     warningText += `📄 فایل‌ها (${fileCount}):\n`;
     for (const f of files) {
-      warningText += `  • ${f.title}\n`;
+      warningText += `  • ${esc(f.title)}\n`;
     }
     warningText += `\n`;
   }
@@ -686,7 +874,7 @@ export async function sendConfirmDeleteCategory(chatId: string | number, categor
     for (const sub of subcategories) {
       const subFileCount = sub.files?.length || 0;
       const subSubCount = sub.subcategories?.length || 0;
-      warningText += `  ➤ ${sub.title}`;
+      warningText += `  ➤ ${esc(sub.title)}`;
       if (subFileCount > 0 || subSubCount > 0) {
         warningText += ` (${subFileCount} فایل`;
         if (subSubCount > 0) warningText += `, ${subSubCount} زیرمجموعه`;
@@ -721,7 +909,7 @@ export async function sendEditCategorySelection(chatId: string | number, parentK
     const parent = await getCategory(parentKey);
     if (!parent) return;
     categories = parent.subcategories || [];
-    text = `✏️ ویرایش زیرمجموعه در: ${parent.title}\n\nانتخاب کنید:`;
+    text = `✏️ ویرایش زیرمجموعه در: ${esc(parent.title)}\n\nانتخاب کنید:`;
     backCallback = `ec_view_${parentKey}`;
   } else {
     // Show root categories
@@ -770,7 +958,7 @@ export async function sendEditCategoryPrompt(chatId: string | number, categoryKe
   const isSub = !!category.parent_key;
   const typeText = isSub ? "زیرمجموعه" : "دسته‌بندی";
 
-  const text = `✏️ ویرایش ${typeText}: ${category.title}\n\n📝 نام جدید را وارد کنید:\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
+  const text = `✏️ ویرایش ${typeText}: ${esc(category.title)}\n\n📝 نام جدید را وارد کنید:\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
 
   const inline_keyboard = [[{ text: "🔙 بازگشت", callback_data: "a_edit_cat" }]];
 
@@ -785,70 +973,48 @@ export async function handleEditCategory(chatId: number, categoryKey: string, ne
     return;
   }
 
-  const newKey = newName
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, "_")
-    .substring(0, 30);
-
-  if (newKey !== categoryKey && await categoryExists(newKey)) {
-    await sendMessage(chatId, "❌ دسته‌بندی با این نام از قبل وجود دارد.");
-    return;
-  }
-
   try {
-    // If key is changing, we need to handle foreign keys carefully
-    if (newKey !== categoryKey) {
-      // First update files to reference new key
-      const { error: filesError } = await getSupabase()
-        .from("files")
-        .update({ category_key: newKey })
-        .eq("category_key", categoryKey);
-      
-      if (filesError) {
-        console.error("Error updating files:", filesError);
-        await sendMessage(chatId, `❌ خطا در به‌روزرسانی فایل‌ها: ${filesError.message}`);
-        return;
-      }
+    // Always regenerate a compact key (never derive from the name — Persian names become underscores)
+    const newKey = generateKey("cat");
 
-      // Then update subcategories' parent_key
-      const { error: subError } = await getSupabase()
-        .from("categories")
-        .update({ parent_key: newKey })
-        .eq("parent_key", categoryKey);
-      
-      if (subError) {
-        console.error("Error updating subcategories:", subError);
-        await sendMessage(chatId, `❌ خطا در به‌روزرسانی زیرمجموعه‌ها: ${subError.message}`);
-        return;
-      }
+    // First update files to reference new key
+    const { error: filesError } = await getSupabase()
+      .from("files")
+      .update({ category_key: newKey })
+      .eq("category_key", categoryKey);
 
-      // Finally update the category itself (key and title)
-      const { error: catError } = await getSupabase()
-        .from("categories")
-        .update({ key: newKey, title: newName })
-        .eq("key", categoryKey);
-      
-      if (catError) {
-        console.error("Error updating category:", catError);
-        await sendMessage(chatId, `❌ خطا در ویرایش دسته‌بندی: ${catError.message}`);
-        return;
-      }
-    } else {
-      // Only title changed
-      const { error: catError } = await getSupabase()
-        .from("categories")
-        .update({ title: newName })
-        .eq("key", categoryKey);
-      
-      if (catError) {
-        console.error("Error updating category title:", catError);
-        await sendMessage(chatId, `❌ خطا در ویرایش عنوان: ${catError.message}`);
-        return;
-      }
+    if (filesError) {
+      console.error("Error updating files:", filesError);
+      await sendMessage(chatId, `❌ خطا در به‌روزرسانی فایل‌ها: ${filesError.message}`);
+      return;
+    }
+
+    // Then update subcategories' parent_key
+    const { error: subError } = await getSupabase()
+      .from("categories")
+      .update({ parent_key: newKey })
+      .eq("parent_key", categoryKey);
+
+    if (subError) {
+      console.error("Error updating subcategories:", subError);
+      await sendMessage(chatId, `❌ خطا در به‌روزرسانی زیرمجموعه‌ها: ${subError.message}`);
+      return;
+    }
+
+    // Finally update the category itself (key and title)
+    const { error: catError } = await getSupabase()
+      .from("categories")
+      .update({ key: newKey, title: newName })
+      .eq("key", categoryKey);
+
+    if (catError) {
+      console.error("Error updating category:", catError);
+      await sendMessage(chatId, `❌ خطا در ویرایش دسته‌بندی: ${catError.message}`);
+      return;
     }
 
     invalidateCategoriesCache();
-    await sendMessage(chatId, `✅ ${category.parent_key ? "زیرمجموعه" : "دسته‌بندی"} "${newName}" با موفقیت ویرایش شد!`);
+    await sendMessage(chatId, `✅ ${category.parent_key ? "زیرمجموعه" : "دسته‌بندی"} "${esc(newName)}" با موفقیت ویرایش شد!`);
     await clearAdminState(chatId);
     await sendEditCategorySelection(chatId);
   } catch (err) {
@@ -879,6 +1045,11 @@ export async function handleDeleteCategory(chatId: number, categoryKey: string) 
     return;
   }
 
+  // Drop their stored copies too (subcategories were already handled above)
+  for (const f of category.files) {
+    await removeStoredFile(f);
+  }
+
   // Delete the category
   const { error: catError } = await getSupabase().from("categories").delete().eq("key", categoryKey);
   if (catError) {
@@ -887,12 +1058,55 @@ export async function handleDeleteCategory(chatId: number, categoryKey: string) 
   }
 
   invalidateCategoriesCache();
-  await sendMessage(chatId, `✅ دسته‌بندی "${category.title}" و تمام محتوای آن حذف شد.`);
+  await sendMessage(chatId, `✅ دسته‌بندی "${esc(category.title)}" و تمام محتوای آن حذف شد.`);
   await sendDeleteCategorySelection(chatId);
 }
 
-export async function sendAddSubcategoryParentSelection(chatId: string | number) {
-  const categories = await getAllCategoriesWithFiles();
+export async function sendPurgeAllPrompt(chatId: number) {
+  const categoryList = await getAllCategoriesWithFiles();
+  let totalFiles = 0;
+  let totalCats = 0;
+  const walk = (cats: Category[]) => {
+    for (const c of cats) {
+      totalFiles += c.files.length;
+      totalCats++;
+      if (c.subcategories) walk(c.subcategories);
+    }
+  };
+  walk(categoryList);
+
+  const text =
+    `⚠️⚠️ هشدار ⚠️⚠️\n\n` +
+    `این عملیات همه چیز را حذف می‌کند:\n` +
+    `📂 ${totalCats} دسته‌بندی و زیرمجموعه\n` +
+    `📄 ${totalFiles} فایل\n` +
+    `📊 آمار دانلودها\n\n` +
+    `برای تایید، این عبارت را دقیقاً تایپ کنید:\n` +
+    `delete_all\n\n` +
+    `هر چیز دیگری عملیات را لغو می‌کند.`;
+
+  const inline_keyboard = [[{ text: "🔙 انصراف", callback_data: "a_mgmt" }]];
+
+  await setAdminState(chatId, "purge_all_confirm");
+  await sendMessage(chatId, text, { inline_keyboard });
+}
+
+export async function handlePurgeAll(chatId: number) {
+  console.log("PURGE ALL started by:", chatId);
+
+  // .neq with an impossible value is the documented way to match all rows
+  await getSupabase().from("files").delete().neq("id", "");
+  await getSupabase().from("categories").delete().neq("key", "");
+
+  await removeAllStoredFiles();
+
+  invalidateCategoriesCache();
+  await clearAdminState(chatId);
+  await sendMessage(chatId, "✅ پاکسازی کامل انجام شد. تمام فایل‌ها و دسته‌بندی‌ها حذف شدند.");
+  await sendAdminManagementMenu(chatId);
+}
+
+export async function sendAddSubcategoryParentSelection(chatId: string | number) {  const categories = await getAllCategoriesWithFiles();
 
   const text = "📂 لطفاً دسته‌بندی والد را برای افزودن زیرمجموعه انتخاب کنید:";
 
@@ -909,7 +1123,7 @@ export async function sendAddSubcategoryNamePrompt(chatId: string | number, pare
   const parent = await getCategory(parentKey);
   if (!parent) return;
 
-  const text = `📂 دسته‌بندی والد: ${parent.title}\n\n📝 لطفاً نام زیرمجموعه جدید را وارد کنید:\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
+  const text = `📂 دسته‌بندی والد: ${esc(parent.title)}\n\n📝 لطفاً نام زیرمجموعه جدید را وارد کنید:\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
 
   const inline_keyboard = [[{ text: "🔙 بازگشت به انتخاب والد", callback_data: "a_add_sub" }]];
 
@@ -917,18 +1131,16 @@ export async function sendAddSubcategoryNamePrompt(chatId: string | number, pare
 }
 
 export async function handleAddSubcategory(chatId: number, parentKey: string, subcategoryName: string) {
-  const subcategoryKey = `${parentKey}_${subcategoryName
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, "_")
-    .substring(0, 20)}`;
+  // Compact unique key — hierarchy comes from parent_key column, not the key itself
+  const subcategoryKey = generateKey("sub");
 
   if (await categoryExists(subcategoryKey)) {
-    await sendMessage(chatId, "❌ زیرمجموعه با این نام از قبل وجود دارد.");
+    await sendMessage(chatId, "❌ خطا در ایجاد زیرمجموعه. لطفاً دوباره تلاش کنید.");
     return;
   }
 
   await createCategory(subcategoryKey, subcategoryName, parentKey);
-  await sendMessage(chatId, `✅ زیرمجموعه "${subcategoryName}" در دسته "${(await getCategory(parentKey))?.title}" ایجاد شد!`);
+  await sendMessage(chatId, `✅ زیرمجموعه "${esc(subcategoryName)}" در دسته "${esc((await getCategory(parentKey))?.title || "")}" ایجاد شد!`);
   await clearAdminState(chatId);
   await sendAdminManagementMenu(chatId);
 }
@@ -938,10 +1150,23 @@ export async function sendManageFilesView(chatId: string | number) {
 
   const inline_keyboard = [];
 
-  for (const cat of categories) {
-    if (cat.files.length === 0) continue;
-    inline_keyboard.push([{ text: `📂 ${cat.title}`, callback_data: `a_files_cat_${cat.key}` }]);
-  }
+  // Recursive walk — include subcategories that contain files
+  const walk = (cats: Category[], prefix = "") => {
+    for (const cat of cats) {
+      if (cat.files.length > 0) {
+        inline_keyboard.push([
+          {
+            text: `${prefix}📂 ${esc(cat.title)} (${cat.files.length} فایل)`,
+            callback_data: `a_files_cat_${cat.key}`,
+          },
+        ]);
+      }
+      if (cat.subcategories && cat.subcategories.length > 0) {
+        walk(cat.subcategories, `${prefix}  ➤ `);
+      }
+    }
+  };
+  walk(categories);
 
   if (inline_keyboard.length === 0) {
     inline_keyboard.push([{ text: "هیچ فایلی وجود ندارد", callback_data: "noop" }]);
@@ -966,7 +1191,7 @@ export async function sendFilesInCategoryForDeletion(chatId: string | number, ca
 
   inline_keyboard.push([{ text: "🔙 بازگشت به لیست دسته‌ها", callback_data: "a_manage_files" }]);
 
-  await sendMessage(chatId, `📂 ${category.title}\n\nروی فایل برای حذف کلیک کنید:`, { inline_keyboard });
+  await sendMessage(chatId, `📂 ${esc(category.title)}\n\nروی فایل برای حذف کلیک کنید:`, { inline_keyboard });
 }
 
 export async function handleDeleteFile(chatId: number, fileId: string) {
@@ -982,9 +1207,98 @@ export async function handleDeleteFile(chatId: number, fileId: string) {
     return;
   }
 
+  await removeStoredFile(file);
+
   invalidateCategoriesCache();
-  await sendMessage(chatId, `✅ فایل "${file.title}" حذف شد.`);
+  await sendMessage(chatId, `✅ فایل "${esc(file.title)}" حذف شد.`);
   await sendManageFilesView(chatId);
+}
+
+// ==========================================
+// 📝 Edit File Description
+// ==========================================
+
+export async function sendEditFileDescCategorySelection(chatId: string | number) {
+  const categories = await getAllCategoriesWithFiles();
+
+  const text = "📝 ویرایش توضیحات فایل:\n\nلطفاً دسته‌بندی مورد نظر را انتخاب کنید:";
+
+  const inline_keyboard = [];
+
+  // Recursive walk — include subcategories that contain files
+  const walk = (cats: Category[], prefix = "") => {
+    for (const cat of cats) {
+      if (cat.files.length > 0) {
+        inline_keyboard.push([
+          { text: `${prefix}📂 ${esc(cat.title)} (${cat.files.length} فایل)`, callback_data: `efd_cat_${cat.key}` },
+        ]);
+      }
+      if (cat.subcategories && cat.subcategories.length > 0) {
+        walk(cat.subcategories, `${prefix}  ➤ `);
+      }
+    }
+  };
+  walk(categories);
+
+  if (inline_keyboard.length === 0) {
+    inline_keyboard.push([{ text: "هیچ فایلی وجود ندارد", callback_data: "noop" }]);
+  }
+
+  inline_keyboard.push([{ text: "🔙 بازگشت به مدیریت", callback_data: "a_back" }]);
+
+  await sendMessage(chatId, text, { inline_keyboard });
+}
+
+export async function sendEditFileDescFileSelection(chatId: string | number, categoryKey: string) {
+  const category = await getCategory(categoryKey);
+  if (!category) return;
+
+  const text = `📂 ${esc(category.title)}\n\nفایل مورد نظر برای ویرایش توضیحات را انتخاب کنید:`;
+
+  const inline_keyboard = category.files.map((file) => [
+    { text: `✏️ ${file.title}`, callback_data: `efd_file_${file.id}` },
+  ]);
+
+  inline_keyboard.push([{ text: "🔙 بازگشت به دسته‌ها", callback_data: "a_edit_file_desc" }]);
+
+  await sendMessage(chatId, text, { inline_keyboard });
+}
+
+export async function sendEditFileDescPrompt(chatId: string | number, fileId: string) {
+  const file = await getFile(fileId);
+  if (!file) return;
+
+  const currentDesc = file.description ? `\n\nتوضیحات فعلی:\n${esc(file.description)}` : "";
+  const text = `✏️ ویرایش توضیحات فایل: ${esc(file.title)}${currentDesc}\n\n📝 توضیحات جدید را وارد کنید (برای حذف توضیحات، "حذف" بنویسید):`;
+
+  const inline_keyboard = [[{ text: "🔙 بازگشت به فایل‌ها", callback_data: `efd_cat_${file.category_key}` }]];
+
+  await sendMessage(chatId, text, { inline_keyboard });
+}
+
+export async function handleEditFileDescription(chatId: number, fileId: string, newDescription: string) {
+  const file = await getFile(fileId);
+  if (!file) {
+    await sendMessage(chatId, "❌ فایل یافت نشد.");
+    return;
+  }
+
+  const description = newDescription === "حذف" ? "" : newDescription;
+
+  const { error } = await getSupabase()
+    .from("files")
+    .update({ description })
+    .eq("id", fileId);
+
+  if (error) {
+    await sendMessage(chatId, `❌ خطا در به‌روزرسانی: ${error.message}`);
+    return;
+  }
+
+  invalidateCategoriesCache();
+  await sendMessage(chatId, `✅ توضیحات فایل "${esc(file.title)}" با موفقیت ${description ? "به‌روزرسانی" : "حذف"} شد!`);
+  await clearAdminState(chatId);
+  await sendEditFileDescCategorySelection(chatId);
 }
 
 export async function sendAddFileCategorySelection(chatId: string | number) {
@@ -1005,7 +1319,7 @@ export async function sendFileSaveLocationPrompt(chatId: string | number, parent
   const parent = await getCategory(parentKey);
   if (!parent) return;
 
-  const text = `📂 دسته‌بندی: ${parent.title}\n\nاین دسته زیرمجموعه دارد. فایل را کجا ذخیره کنیم؟`;
+  const text = `📂 دسته‌بندی: ${esc(parent.title)}\n\nاین دسته زیرمجموعه دارد. فایل را کجا ذخیره کنیم؟`;
 
   const inline_keyboard = [
     [{ text: `📁 در همین دسته (${parent.title})`, callback_data: `sf_c_${parentKey}` }],
@@ -1022,7 +1336,7 @@ export async function sendAddFileDescriptionPrompt(chatId: string | number, cate
   const category = await getCategory(categoryKey);
   if (!category) return;
 
-  const text = `📤 دسته‌بندی: ${category.title}\n\n📄 لطفاً توضیحات فایل را وارد کنید (اختیاری):\n\nبرای رد کردن توضیحات، دکمه "⏭️ بدون توضیحات" را بزنید.`;
+  const text = `📤 دسته‌بندی: ${esc(category.title)}\n\n📄 لطفاً توضیحات فایل را وارد کنید (اختیاری):\n\nبرای رد کردن توضیحات، دکمه "⏭️ بدون توضیحات" را بزنید.`;
 
   const inline_keyboard = [
     [{ text: "⏭️ بدون توضیحات", callback_data: `a_skip_desc_${categoryKey}` }],
@@ -1036,8 +1350,8 @@ export async function sendAddFileUploadPrompt(chatId: string | number, categoryK
   const category = await getCategory(categoryKey);
   if (!category) return;
 
-  const descText = description ? `\n📄 توضیحات: ${description}` : "";
-  const text = `📤 دسته‌بندی: ${category.title}${descText}\n\n📎 لطفاً فایل را ارسال کنید (به عنوان Document).\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
+  const descText = description ? `\n📄 توضیحات: ${esc(description)}` : "";
+  const text = `📤 دسته‌بندی: ${esc(category.title)}${descText}\n\n📎 لطفاً فایل را ارسال کنید (به عنوان Document).\n\nبرای انصراف، دکمه بازگشت را بزنید.`;
 
   const inline_keyboard = [[{ text: "🔙 بازگشت به توضیحات", callback_data: `a_enter_desc_${categoryKey}` }]];
 
@@ -1053,57 +1367,144 @@ export async function sendAddCategoryPrompt(chatId: string | number) {
 }
 
 export async function sendStatsView(chatId: string | number) {
-  const categories = await getAllCategoriesWithFiles();
+  try {
+    const categories = await getAllCategoriesWithFiles();
 
-  let text = "📊 آمار دانلود فایل‌ها:\n\n";
-  let hasData = false;
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  for (const category of categories) {
-    let categoryText = "";
-    for (const file of category.files) {
-      const count = await getDownloadCount(file.id);
-      if (count > 0) {
-        hasData = true;
-        categoryText += `  📄 ${file.title}: ${count} دانلود\n`;
+    let text = "📊 آمار دانلود فایل‌ها:\n";
+    let grandTotal = 0;
+    let fileCount = 0;
+
+    // Recursive walker that includes subcategories
+    const walk = (cats: Category[], prefix = "") => {
+      for (const category of cats) {
+        const files = category.files || [];
+        if (files.length > 0) {
+          let catTotal = 0;
+          let catText = "";
+          for (const file of files) {
+            const count = file.downloads || 0;
+            catTotal += count;
+            fileCount++;
+            catText += `${prefix}  📄 ${esc(file.title)}: ${count} دانلود\n`;
+          }
+          text += `\n${SEP}\n${prefix}📂 ${esc(category.title)} (${catTotal} دانلود):\n${catText}`;
+          grandTotal += catTotal;
+        }
+        if (category.subcategories && category.subcategories.length > 0) {
+          walk(category.subcategories, `${prefix}  `);
+        }
       }
+    };
+
+    walk(categories);
+
+    if (fileCount === 0) {
+      text += `\n\nهنوز هیچ فایلی ثبت نشده است.`;
+    } else {
+      text += `\n─────────────────────\n📈 مجموع کل: ${grandTotal} دانلود از ${fileCount} فایل`;
     }
-    if (categoryText) {
-      text += `📂 ${category.title}:\n${categoryText}\n`;
-    }
+
+    const inline_keyboard = [[{ text: "🔙 بازگشت به مدیریت", callback_data: "a_back" }]];
+
+    await sendMessage(chatId, text, { inline_keyboard });
+  } catch (err) {
+    console.error("sendStatsView error:", err);
+    await sendMessage(chatId, `❌ خطا در دریافت آمار: ${err instanceof Error ? err.message : "نامشخص"}`);
   }
-
-  if (!hasData) {
-    text += "هنوز هیچ دانلودی ثبت نشده است.";
-  }
-
-  const inline_keyboard = [[{ text: "🔙 بازگشت به مدیریت", callback_data: "a_back" }]];
-
-  await sendMessage(chatId, text, { inline_keyboard });
 }
 
 export async function sendUsersView(chatId: string | number) {
-  const users = await getAllUsers();
+  try {
+    console.log("sendUsersView called for:", chatId);
+    const users = await getAllUsers();
+    console.log("sendUsersView users count:", users.length);
 
-  let text = `👥 لیست کاربران (${users.length} کاربر):\n\n`;
-
-  if (users.length === 0) {
-    text += "هنوز کاربری ثبت نشده است.";
-  } else {
-    users.slice(0, 50).forEach((user, index) => {
-      const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || "نامشخص";
-      const username = user.username ? `@${user.username}` : "بدون یوزرنیم";
-      const adminBadge = user.is_admin ? " 👑" : "";
-      text += `${index + 1}. ${name}${adminBadge} (${username}) - ID: ${user.chat_id}\n`;
-    });
-
-    if (users.length > 50) {
-      text += `\n... و ${users.length - 50} کاربر دیگر`;
+    // Fetch download logs (silent fallback if table doesn't exist yet)
+    let downloadLogs: { file_id: string; user_id: number }[] = [];
+    const { data: logs, error: logsError } = await getSupabase()
+      .from("downloads")
+      .select("file_id, user_id")
+      .order("created_at", { ascending: false });
+    if (logsError) {
+      console.log("downloads table not available:", logsError.message);
+    } else {
+      downloadLogs = logs || [];
     }
+
+  // Build file id -> title map (includes subcategories)
+  const categories = await getAllCategoriesWithFiles();
+  const fileMap = new Map<string, string>();
+  const walk = (cats: Category[]) => {
+    for (const c of cats) {
+      for (const f of c.files) if (f.id) fileMap.set(f.id, f.title);
+      if (c.subcategories) walk(c.subcategories);
+    }
+  };
+  walk(categories);
+
+  // Group downloads per user
+  const userDownloads = new Map<number, { title: string; count: number }[]>();
+  for (const log of downloadLogs) {
+    // Skip malformed rows (null file_id / user_id)
+    if (!log.file_id || !log.user_id) continue;
+    if (!userDownloads.has(log.user_id)) userDownloads.set(log.user_id, []);
+    const list = userDownloads.get(log.user_id)!;
+    const title = fileMap.get(log.file_id) || log.file_id || "نامشخص";
+    const existing = list.find((x) => x.title === title);
+    if (existing) existing.count++;
+    else list.push({ title, count: 1 });
   }
 
-  const inline_keyboard = [[{ text: "🔙 بازگشت به مدیریت", callback_data: "a_back" }]];
+    // Escape HTML entities (parse_mode is HTML)
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  await sendMessage(chatId, text, { inline_keyboard });
+    let text = `👥 لیست کاربران (${users.length} کاربر):`;
+
+    if (users.length === 0) {
+      text += `\n\nهنوز کاربری ثبت نشده است.`;
+    } else {
+      let shown = 0;
+      for (const user of users) {
+        if (shown >= 25) break;
+
+        const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || "نامشخص";
+        const username = user.username ? `@${user.username}` : "—";
+        const phone = user.phone_number || "ثبت نشده";
+        const adminBadge = user.is_admin ? " 👑" : "";
+
+        let block = `\n${SEP}\n${shown + 1}. ${esc(name)}${adminBadge}`;
+        block += `\n   📱 ${esc(phone)}`;
+        block += `\n   👤 ${esc(username)} | 🆔 ${user.chat_id}`;
+
+        const downloads = userDownloads.get(user.chat_id);
+        if (downloads && downloads.length > 0) {
+          block += `\n   📥 دانلودها:`;
+          for (const d of downloads) {
+            block += `\n     • ${esc(d.title)} ×${d.count}`;
+          }
+        } else {
+          block += `\n   📥 دانلودها: ندارد`;
+        }
+
+        // Stop before exceeding Telegram's 4096 char limit
+        if (text.length + block.length > 3800) {
+          text += `\n\n... و ${users.length - shown} کاربر دیگر`;
+          break;
+        }
+        text += block;
+        shown++;
+      }
+    }
+
+    const inline_keyboard = [[{ text: "🔙 بازگشت به مدیریت", callback_data: "a_back" }]];
+
+    await sendMessage(chatId, text, { inline_keyboard });
+  } catch (err) {
+    console.error("sendUsersView error:", err);
+    await sendMessage(chatId, `❌ خطا در دریافت لیست کاربران: ${err instanceof Error ? err.message : "نامشخص"}`);
+  }
 }
 
 export async function handleAdminFileUpload(
@@ -1121,13 +1522,11 @@ export async function handleAdminFileUpload(
     return;
   }
 
-  const generatedFileId = document.file_name
-    .replace(/\.[^/.]+$/, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, "_");
+  // Compact unique file ID to avoid collisions and keep callbacks short
+  const generatedFileId = generateKey("f");
 
   if (await fileExists(generatedFileId)) {
-    await sendMessage(chatId, "❌ فایلی با این نام از قبل وجود دارد. لطفاً فایل را با نام دیگر آپلود کنید.");
+    await sendMessage(chatId, "❌ خطا در افزودن فایل. لطفاً دوباره تلاش کنید.");
     return;
   }
 
@@ -1141,37 +1540,38 @@ export async function handleAdminFileUpload(
     description: description || "",
   });
 
-  const fileUrl = await getTelegramFileUrl(document.file_id);
+  // Persist bytes into backend storage right away (lazy migration covers legacy rows)
+  const stored = await ensureStoredFile({
+    id: generatedFileId,
+    filename: document.file_name,
+    telegram_file_id: document.file_id,
+  });
+
   const displayTitle = fileName || document.file_name.replace(/\.[^/.]+$/, "");
-  if (fileUrl) {
-    await sendMessage(
-      chatId,
-      `✅ فایل "${displayTitle}" با موفقیت به دسته "${category.title}" اضافه شد!\n\n📎 شناسه فایل: ${generatedFileId}\n📥 لینک مستقیم: ${fileUrl}`,
-    );
-  } else {
-    await sendMessage(
-      chatId,
-      `✅ فایل "${displayTitle}" به دسته "${category.title}" اضافه شد (لینک مستقیم در دسترس نیست).`,
-    );
-  }
+  const fileUrl = `${SITE_URL}/api/files/${generatedFileId}`;
+  await sendMessage(
+    chatId,
+    `✅ فایل "${esc(displayTitle)}" با موفقیت به دسته "${esc(category.title)}" اضافه شد!\n\n📎 شناسه فایل: ${generatedFileId}\n📥 لینک دانلود: ${fileUrl}` +
+      (stored
+        ? ""
+        : "\n\n⚠️ ذخیره‌سازی در سرور ناموفق بود؛ در درخواست بعدی به‌صورت خودکار دوباره تلاش می‌شود."),
+  );
 
   await clearAdminState(chatId);
   await sendAdminManagementMenu(chatId);
 }
 
 export async function handleAddCategory(chatId: number, categoryName: string) {
-  const categoryKey = categoryName
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, "_")
-    .substring(0, 30);
+  // Compact unique key (keeps callback_data short enough for Telegram)
+  const categoryKey = generateKey("cat");
 
   if (await categoryExists(categoryKey)) {
-    await sendMessage(chatId, "❌ دسته‌بندی با این نام از قبل وجود دارد.");
+    await sendMessage(chatId, "❌ خطا در ایجاد دسته‌بندی. لطفاً دوباره تلاش کنید.");
     return;
   }
 
   await createCategory(categoryKey, categoryName);
-  await sendMessage(chatId, `✅ دسته‌بندی "${categoryName}" با موفقیت ایجاد شد!`);
+  await sendMessage(chatId, `✅ دسته‌بندی "${esc(categoryName)}" با موفقیت ایجاد شد!`);
   await clearAdminState(chatId);
   await sendAdminManagementMenu(chatId);
 }
@@ -1186,11 +1586,23 @@ export async function handleAdminCallback(chatId: number, buttonData: string) {
     await clearAdminState(chatId);
     await sendManageFilesView(chatId);
   } else if (buttonData.startsWith("a_files_cat_")) {
+    console.log("Admin files in category:", chatId, buttonData);
     const categoryKey = buttonData.replace("a_files_cat_", "");
     await sendFilesInCategoryForDeletion(chatId, categoryKey);
   } else if (buttonData.startsWith("a_delete_file_")) {
+    console.log("Admin delete file:", chatId, buttonData);
     const fileId = buttonData.replace("a_delete_file_", "");
     await handleDeleteFile(chatId, fileId);
+  } else if (buttonData === "a_edit_file_desc") {
+    await clearAdminState(chatId);
+    await sendEditFileDescCategorySelection(chatId);
+  } else if (buttonData.startsWith("efd_cat_")) {
+    const categoryKey = buttonData.replace("efd_cat_", "");
+    await sendEditFileDescFileSelection(chatId, categoryKey);
+  } else if (buttonData.startsWith("efd_file_")) {
+    const fileId = buttonData.replace("efd_file_", "");
+    await setAdminState(chatId, "edit_file_description", { selectedFileId: fileId });
+    await sendEditFileDescPrompt(chatId, fileId);
   } else if (buttonData === "a_add_cat") {
     await setAdminState(chatId, "add_category_name");
     await sendAddCategoryPrompt(chatId);
@@ -1262,6 +1674,9 @@ export async function handleAdminCallback(chatId: number, buttonData: string) {
     console.log("Admin delete category clicked:", chatId);
     await clearAdminState(chatId);
     await sendDeleteCategorySelection(chatId);
+  } else if (buttonData === "a_purge_all") {
+    console.log("Admin purge all clicked:", chatId);
+    await sendPurgeAllPrompt(chatId);
   } else if (buttonData.startsWith("dc_view_")) {
     const categoryKey = buttonData.replace("dc_view_", "");
     await sendDeleteCategorySelection(chatId, categoryKey);
