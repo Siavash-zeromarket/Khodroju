@@ -4,6 +4,14 @@ import { ChevronDown, Loader2, Search, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
+const DROPDOWN_LIST_MAX_HEIGHT = 224; // ≈ Tailwind max-h-56
+const DROPDOWN_LIST_MIN_HEIGHT = 96;
+const DROPDOWN_SEARCH_ROW_HEIGHT = 40; // search input row + bottom border
+const DROPDOWN_ESTIMATED_HEIGHT = 280; // search row + max list + margins
+const DROPDOWN_MIN_WIDTH = 160;
+const VIEWPORT_MARGIN = 8;
+const TRIGGER_GAP = 4;
+
 interface SearchSelectProps {
   id?: string;
   label?: string;
@@ -34,6 +42,7 @@ export function SearchSelect({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
+  const [listMaxHeight, setListMaxHeight] = useState(DROPDOWN_LIST_MAX_HEIGHT);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -65,15 +74,42 @@ export function SearchSelect({
   );
 
   const updateDropdownPosition = useCallback(() => {
-    if (triggerRef.current) {
-      const rect = triggerRef.current.getBoundingClientRect();
-      setDropdownStyle({
-        top: rect.bottom + window.scrollY + 4, // mt-1 = 4px
-        left: rect.left + window.scrollX,
-        width: rect.width,
-        minWidth: rect.width,
-      });
-    }
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+
+    const rect = trigger.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    const width = Math.max(rect.width, DROPDOWN_MIN_WIDTH);
+    const spaceBelow = viewportHeight - rect.bottom - TRIGGER_GAP;
+    const spaceAbove = rect.top - TRIGGER_GAP;
+    const openUp =
+      spaceBelow < DROPDOWN_ESTIMATED_HEIGHT && spaceAbove > spaceBelow;
+
+    const available = openUp ? spaceAbove : spaceBelow;
+    const nextListMaxHeight = Math.min(
+      DROPDOWN_LIST_MAX_HEIGHT,
+      Math.max(
+        DROPDOWN_LIST_MIN_HEIGHT,
+        available - DROPDOWN_SEARCH_ROW_HEIGHT,
+      ),
+    );
+
+    const left = Math.min(
+      Math.max(VIEWPORT_MARGIN, rect.left),
+      Math.max(VIEWPORT_MARGIN, viewportWidth - width - VIEWPORT_MARGIN),
+    );
+
+    setListMaxHeight(nextListMaxHeight);
+    setDropdownStyle({
+      position: "fixed",
+      width,
+      left,
+      ...(openUp
+        ? { top: "auto", bottom: viewportHeight - rect.top + TRIGGER_GAP }
+        : { top: rect.bottom + TRIGGER_GAP, bottom: "auto" }),
+    });
   }, []);
 
   useEffect(() => {
@@ -81,11 +117,11 @@ export function SearchSelect({
       setQuery("");
       updateDropdownPosition();
       requestAnimationFrame(() => inputRef.current?.focus());
-      window.addEventListener("scroll", updateDropdownPosition);
+      window.addEventListener("scroll", updateDropdownPosition, true);
       window.addEventListener("resize", updateDropdownPosition);
     }
     return () => {
-      window.removeEventListener("scroll", updateDropdownPosition);
+      window.removeEventListener("scroll", updateDropdownPosition, true);
       window.removeEventListener("resize", updateDropdownPosition);
     };
   }, [open, updateDropdownPosition]);
@@ -120,7 +156,7 @@ export function SearchSelect({
     <div
       data-search-select-dropdown
       ref={listRef}
-      className="bg-popover border border-border rounded-lg shadow-lg z-50 overflow-hidden"
+      className="fixed z-[60] overflow-hidden bg-popover border border-border rounded-lg shadow-lg"
       style={dropdownStyle}
     >
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
@@ -144,7 +180,10 @@ export function SearchSelect({
           </button>
         )}
       </div>
-      <div className="max-h-56 overflow-y-auto overscroll-contain py-1">
+      <div
+        className="overflow-y-auto overscroll-contain py-1"
+        style={{ maxHeight: listMaxHeight }}
+      >
         {filtered.length === 0 ? (
           <p className="px-4 py-6 text-center text-xs text-muted-foreground">
             {emptyText}
