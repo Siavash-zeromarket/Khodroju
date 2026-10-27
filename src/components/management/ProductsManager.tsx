@@ -1,0 +1,235 @@
+"use client";
+
+import StatusBadge from "@/components/shared/StatusBadge";
+import { brandModelLabel, cityLabel } from "@/context/carLabels";
+import { formatPrice } from "@/context/data";
+import { useListings } from "@/hooks/useListings";
+import {
+  listingRowToListing,
+  softDeleteListing,
+} from "@/lib/supabase/listings";
+import { supabase } from "@/lib/supabase/client";
+import type { PlatformUser, ProductInput } from "@/types/admin";
+import type { Listing } from "@/types/dataTypes";
+import {
+  Eye,
+  Pencil,
+  Plus,
+  ShoppingBag,
+  ShoppingCart,
+  Trash2,
+  Upload,
+} from "lucide-react";
+import Link from "next/link";
+import { useState } from "react";
+import { toast } from "sonner";
+import BulkImportProductsModal from "./BulkImportProductsModal";
+import ConfirmDialog from "./ConfirmDialog";
+import RecordSaleModal from "./RecordSaleModal";
+import { useSession } from "@/context/SessionProvider";
+
+interface Props {
+  user: PlatformUser;
+}
+
+export default function ProductsManager({ user }: Props) {
+  const { listings: rawListings } = useListings({ includeDeleted: true });
+  const { role: viewerRole } = useSession();
+  const products = rawListings
+    .filter((r) => r.seller_id === user.id)
+    .map((r) => listingRowToListing(r));
+  const [pendingDelete, setPendingDelete] = useState<Listing | null>(null);
+  const [pendingSale, setPendingSale] = useState<Listing | null>(null);
+  const [bulkOpen, setBulkOpen] = useState(false);
+
+  const canHaveProducts = user.role !== "USER";
+  const isAdminOrOwner = viewerRole === "admin" || viewerRole === "owner";
+
+  const handleBulk = async (rows: ProductInput[]) => {
+    for (const row of rows) {
+      await supabase.from("listings").insert({
+        seller_id: user.id,
+        brand: row.brand,
+        model: row.model,
+        trim: row.trim,
+        year: row.year,
+        price: row.price,
+        price_unit: "تومان",
+        color: row.color,
+        color_hex: row.colorHex ?? "#1b4fd8",
+        city: row.city,
+        shipment_days: row.deliveryDays,
+        body_type: row.bodyType,
+        engine_power: row.engine,
+        gearbox: row.transmission,
+        fuel: row.fuelType,
+        other_options: row.factoryOptions ?? [],
+        status: "WAITING",
+        slug: `${row.brand}-${row.model}-${row.year}-${crypto.randomUUID().slice(0, 8)}`.replace(
+          /\s+/g,
+          "-",
+        ),
+      });
+    }
+    toast.success(`${rows.length.toLocaleString("fa-IR")} محصول افزوده شد`);
+    setBulkOpen(false);
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <h3 className="text-sm font-700 text-foreground">
+          محصولات ({products.length.toLocaleString("fa-IR")})
+        </h3>
+        {canHaveProducts && (
+          <div className="flex items-center gap-2">
+            {isAdminOrOwner && (
+              <button
+                onClick={() => setBulkOpen(true)}
+                className="btn-secondary text-xs"
+              >
+                <Upload size={13} />
+                ورود گروهی (اکسل)
+              </button>
+            )}
+            <Link
+              href={`/dashboard/manage/products/new?owner=${user.id}`}
+              className="btn-primary text-xs"
+            >
+              <Plus size={13} />
+              افزودن محصول
+            </Link>
+          </div>
+        )}
+      </div>
+
+      {!canHaveProducts ? (
+        <div className="rounded-xl border border-dashed border-border py-8 flex flex-col items-center gap-1.5 text-center">
+          <ShoppingBag size={18} className="text-muted-foreground" />
+          <p className="text-xs text-muted-foreground">
+            این حساب خریدار است و محصولی ندارد. برای افزودن محصول، ابتدا نقش را
+            به فروشنده تغییر دهید.
+          </p>
+        </div>
+      ) : products.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border py-8 text-center text-xs text-muted-foreground">
+          این فروشنده محصولی ندارد.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {products.map((p) => {
+            const isDeleted = !!p.deletedAt;
+            return (
+              <div
+                key={p.id}
+                className={`flex items-center justify-between gap-3 rounded-xl border border-border px-3 py-2.5 transition-opacity duration-150 ${
+                  isDeleted ? "opacity-60" : ""
+                }`}
+              >
+                <div className="min-w-0">
+                  <div className="text-sm font-600 text-foreground truncate">
+                    {brandModelLabel(p)} · {p.trim}
+                  </div>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-price text-xs text-foreground">
+                      {formatPrice(p.price)} تومان
+                    </span>
+                    <span className="text-2xs text-muted-foreground">
+                      {cityLabel(p.city)}
+                    </span>
+                    {isDeleted && p.deletedAt && (
+                      <span className="text-2xs text-muted-foreground">
+                        حذف شده در{" "}
+                        {new Date(p.deletedAt).toLocaleDateString("fa-IR", {
+                          year: "numeric",
+                          month: "long",
+                          day: "numeric",
+                        })}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {isDeleted ? (
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-lg bg-danger/10 text-danger text-2xs font-700 border border-danger/20">
+                      حذف شده
+                    </span>
+                  ) : (
+                    <StatusBadge status={p.status} />
+                  )}
+                  <Link
+                    href={`/market/listings/${p.id}`}
+                    aria-label="مشاهده محصول"
+                    title="مشاهده"
+                    className="flex items-center justify-center w-8 h-8 rounded-lg border border-border text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors duration-150"
+                  >
+                    <Eye size={14} />
+                  </Link>
+                  <Link
+                    href={`/dashboard/manage/products/${p.id}`}
+                    aria-label="ویرایش محصول"
+                    title="ویرایش"
+                    className="flex items-center justify-center w-8 h-8 rounded-lg border border-border text-muted-foreground hover:text-primary hover:border-primary/40 transition-colors duration-150"
+                  >
+                    <Pencil size={14} />
+                  </Link>
+                  <button
+                    onClick={() => setPendingSale(p)}
+                    aria-label="ثبت معامله"
+                    title="ثبت معامله"
+                    className="flex items-center justify-center w-8 h-8 rounded-lg border border-border text-muted-foreground hover:text-success hover:border-success/40 transition-colors duration-150"
+                  >
+                    <ShoppingCart size={14} />
+                  </button>
+                  <button
+                    onClick={() => setPendingDelete(p)}
+                    aria-label="حذف محصول"
+                    title="حذف"
+                    className="flex items-center justify-center w-8 h-8 rounded-lg border border-border text-muted-foreground hover:text-danger hover:border-danger/40 transition-colors duration-150"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {pendingSale && (
+        <RecordSaleModal
+          listing={pendingSale}
+          sellerId={user.id}
+          onRecorded={() => {}}
+          onClose={() => setPendingSale(null)}
+        />
+      )}
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title="حذف محصول"
+          description={`«${brandModelLabel(pendingDelete)} ${pendingDelete.trim}» از دید عموم حذف می‌شود و فقط برای مدیران قابل مشاهده می‌ماند.`}
+          confirmLabel="حذف"
+          onConfirm={async () => {
+            const { error } = await softDeleteListing(pendingDelete.id);
+            if (error) {
+              toast.error(error.message);
+              return;
+            }
+            setPendingDelete(null);
+            toast.success("محصول حذف شد");
+          }}
+          onClose={() => setPendingDelete(null)}
+        />
+      )}
+
+      {bulkOpen && (
+        <BulkImportProductsModal
+          sellerName={user.name}
+          onImport={handleBulk}
+          onClose={() => setBulkOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
