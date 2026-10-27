@@ -131,4 +131,6 @@ The UI is fully right-to-left; all numbers render in Persian digits and prices/d
 the Persian (Jalali) calendar. Design tokens and reusable utility classes live in
 `src/app/globals.css`, and all mock data lives in `src/context/`.
 
-> Looking for what's next? See [`todo.md`](./todo.md) for the project backlog.
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+Chnage
