@@ -405,6 +405,14 @@
   .filter-chip:hover {
     background-color: #ddeaff;
   }
+  .filter-chip-active {
+    background-color: var(--primary);
+    border-color: var(--primary);
+    color: #ffffff;
+  }
+  .filter-chip-active:hover {
+    background-color: var(--primary);
+  }
   .price-up {
     color: var(--success);
     font-size: 0.75rem;
