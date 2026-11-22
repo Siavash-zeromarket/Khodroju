@@ -22,7 +22,7 @@ import ProductsCatalog from "../owner-panel/ProductsCatalog";
 import { useAdminUsers } from "@/hooks/useAdminUsers";
 import { getUnreadCount } from "@/lib/supabase/userNotifications";
 import Avatar from "../shared/Avatar";
-import VehicleRequestsTab from "../management/VehicleRequestsTab";
+import CampaignsManager from "../management/campaigns/CampaignsManager";
 
 const faNum = (n: number) => n.toLocaleString("fa-IR");
 
@@ -33,7 +33,7 @@ const tabs = [
   { id: "notifications", label: "اعلان‌ها" },
   { id: "tickets", label: "تیکت‌ها" },
   { id: "market", label: "تراکنش‌های بازار" },
-  { id: "vehicleRequests", label: "ثبت نام های خودرو" },
+  { id: "vehicleRequests", label: "طرح‌های ثبت نام خودرو" },
 ] as const;
 
 type TabId = (typeof tabs)[number]["id"];
@@ -189,7 +189,7 @@ export default function AdminDashboard() {
       {active === "tickets" && <TicketsTab />}
       {active === "market" && <MarketRequestsFeed />}
       {active === "posts" && <ProductsCatalog />}
-      {active === "vehicleRequests" && <VehicleRequestsTab />}
+      {active === "vehicleRequests" && <CampaignsManager />}
     </div>
   );
 }
