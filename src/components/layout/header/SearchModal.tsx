@@ -471,8 +471,8 @@ export default function SearchModal({ onClose }: Props) {
                   </h3>
                   {sellerResults.map((s) => (
                     <Link
-                      key={`seller-${s.slug}`}
-                      href={`/sellers/${s.slug}`}
+                      key={`seller-${s.id}`}
+                      href={`/sellers/${s.id}`}
                       onClick={onClose}
                       className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-muted transition-colors duration-150"
                     >

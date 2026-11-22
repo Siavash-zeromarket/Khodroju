@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { parseUuidParam } from "@/lib/utils";
 import {
   fetchListings,
   fetchListingById,
@@ -104,15 +105,17 @@ export function useSellerListings(sellerId: string): UseSellerListingsResult {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    if (!sellerId) {
+    const id = parseUuidParam(sellerId);
+    if (!id) {
       setListings([]);
+      setError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchListingsBySeller(sellerId);
+      const data = await fetchListingsBySeller(id);
       setListings(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "خطا در دریافت آگهی‌ها");

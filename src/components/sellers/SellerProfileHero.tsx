@@ -2,6 +2,11 @@
 
 import AdminManageButton from "@/components/management/AdminManageButton";
 import VerifiedBadge from "@/components/shared/VerifiedBadeg";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useBanners } from "@/context/BannerProvider";
 import { toFa } from "@/context/carLabels";
 import type { SellerSummary } from "@/types/dataTypes";
@@ -65,7 +70,7 @@ export default function SellerProfileHero({ seller }: Props) {
       <div className="px-6 pb-6 z-10">
         {/* Avatar + identity + actions */}
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 -mt-10 ">
-          <div className="flex items-end gap-4">
+          <div className="flex items-end gap-4 min-w-0">
             <div className="w-20 h-20 rounded-2xl bg-card ring-4 ring-card shrink-0 z-10">
               <Avatar
                 src={seller.avatar_path ?? seller.avatar}
@@ -73,19 +78,32 @@ export default function SellerProfileHero({ seller }: Props) {
                 size="w-20 h-20"
               />
             </div>
-            <div className="pb-1 z-10 bg-white px-2 rounded-lg">
+            <div className="pb-1 z-10 bg-white px-2 rounded-lg min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <h1 className="text-2xl font-800 text-foreground">
                   {seller.name}
                 </h1>
                 {seller.verified && <VerifiedBadge size="md" />}
               </div>
-              <div className="flex items-center gap-3 mt-1 flex-wrap text-xs text-muted-foreground">
-                <span className="flex items-center gap-1">
+              <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground min-w-0">
+                <span className="flex items-center gap-1 shrink-0 whitespace-nowrap">
                   <MapPin size={12} />
                   {seller.city}
                 </span>
-                <span>{seller.brands.join(" · ")}</span>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="min-w-0 flex-1 truncate text-right max-w-96">
+                      {seller.brands.join(" · ")}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent
+                    dir="rtl"
+                    sideOffset={6}
+                    className="max-w-sm text-right leading-relaxed"
+                  >
+                    {seller.brands.join(" · ")}
+                  </TooltipContent>
+                </Tooltip>
               </div>
             </div>
           </div>

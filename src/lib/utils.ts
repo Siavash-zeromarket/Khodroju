@@ -41,6 +41,23 @@ export function formatPersianDateTime(iso: string): string {
   }).format(date);
 }
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Normalise a route param that may arrive percent-encoded and return it only
+ *  when it is a UUID. Non-UUID values (e.g. legacy name-based links) yield null
+ *  so callers can skip the query instead of hitting a Postgres 22P02 error. */
+export function parseUuidParam(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let value = raw.trim();
+  try {
+    value = decodeURIComponent(value).trim();
+  } catch {
+    // Malformed escape sequence — keep the raw value.
+  }
+  return UUID_RE.test(value) ? value : null;
+}
+
 /** URL-safe slug from a latin seller name, e.g. "Aria Motors" → "aria-motors". */
 export function sellerSlug(sellerName: string): string {
   return sellerName

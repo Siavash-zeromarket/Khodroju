@@ -53,8 +53,8 @@ export async function GET(req: NextRequest) {
     let query = supabase.from("buy_requests").select(
       `
         id, offered_price, message, status, created_at,
-        buyer:buyer_id(full_name),
-        seller:seller_id(full_name),
+        buyer:buyer_id(id, full_name),
+        seller:seller_id(id, full_name),
         listing:listing_id(brand, model, year, trim)
       `,
       { count: "exact" },

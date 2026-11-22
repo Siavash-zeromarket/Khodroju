@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { parseUuidParam } from "@/lib/utils";
 import type { SellerSummary } from "@/types/dataTypes";
 import {
   fetchSellerBrandsAndMinPrice,
@@ -67,15 +68,17 @@ export function useSeller(id: string): UseSellerResult {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    if (!id) {
+    const sellerId = parseUuidParam(id);
+    if (!sellerId) {
       setSeller(null);
+      setError(null);
       setLoading(false);
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      const row = await fetchSellerById(id);
+      const row = await fetchSellerById(sellerId);
       if (!row) {
         setSeller(null);
         setLoading(false);

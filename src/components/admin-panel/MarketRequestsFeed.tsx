@@ -21,8 +21,8 @@ interface MarketRequest {
   message: string | null;
   status: string;
   created_at: string;
-  buyer: { full_name: string } | null;
-  seller: { full_name: string } | null;
+  buyer: { id: string; full_name: string } | null;
+  seller: { id: string; full_name: string } | null;
   listing: { brand: string; model: string; year: number; trim: string } | null;
 }
 
@@ -242,7 +242,7 @@ export default function MarketRequestsFeed() {
                         </td>
                         <td className="py-2.5 px-3">
                           <Link
-                            href={`/sellers/${r.seller?.full_name ?? ""}`}
+                            href={`/sellers/${r.seller?.id ?? ""}`}
                             className="text-primary hover:underline"
                           >
                             {r.seller?.full_name ?? "—"}

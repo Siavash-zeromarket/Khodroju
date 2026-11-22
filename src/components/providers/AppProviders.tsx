@@ -1,5 +1,6 @@
 "use client";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { AdminProvider } from "@/context/AdminProvider";
 import { BannerProvider } from "@/context/BannerProvider";
 import { BlogProvider } from "@/context/BlogProvider";
@@ -16,7 +17,9 @@ export default function AppProviders({ children }: { children: ReactNode }) {
       <SessionProvider>
         <AdminProvider>
           <BlogProvider>
-            <BannerProvider>{children}</BannerProvider>
+            <BannerProvider>
+              <TooltipProvider>{children}</TooltipProvider>
+            </BannerProvider>
           </BlogProvider>
         </AdminProvider>
       </SessionProvider>

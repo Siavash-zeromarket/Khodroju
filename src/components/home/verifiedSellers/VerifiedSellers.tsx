@@ -67,7 +67,7 @@ export default function VerifiedSellers({ sellers }: VerifiedSellersProps) {
         {top.map((seller, i) => (
           <Reveal key={seller.id} delay={i * 0.08}>
             <Link
-              href={`/sellers/${seller.slug}`}
+              href={`/sellers/${seller.id}`}
               className="card-elevated card-hover p-5 cursor-pointer h-full block"
             >
               {/* Avatar + name */}
